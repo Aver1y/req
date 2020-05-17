@@ -2,6 +2,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveLift #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE KindSignatures #-}
@@ -12,6 +13,7 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskellQuotes #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -145,6 +147,8 @@ module Network.HTTP.Req
     useHttpURI,
     useHttpsURI,
     useURI,
+    urlQ,
+    urlWithOptsQ,
 
     -- ** Body
     -- $body
@@ -251,10 +255,14 @@ import Data.Maybe (fromMaybe)
 import Data.Proxy
 import Data.Semigroup hiding (Option, option)
 import Data.Text (Text)
+import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import Data.Typeable (Typeable)
 import GHC.Generics
 import GHC.TypeLits
+import qualified Language.Haskell.TH as TH
+import qualified Language.Haskell.TH.Quote as TH
+import qualified Language.Haskell.TH.Syntax as TH
 import qualified Network.Connection as NC
 import qualified Network.HTTP.Client as L
 import qualified Network.HTTP.Client.Internal as LI
@@ -860,7 +868,7 @@ instance HttpMethod method => RequestComponent (Womb "method" method) where
 -- > -- https://%D1%8E%D0%BD%D0%B8%D0%BA%D0%BE%D0%B4.%D1%80%D1%84
 data Url (scheme :: Scheme) = Url Scheme (NonEmpty Text)
   -- NOTE The second value is the path segments in reversed order.
-  deriving (Eq, Ord, Show, Data, Typeable, Generic)
+  deriving (Eq, Ord, Show, Data, Typeable, Generic, TH.Lift)
 
 -- | Given host name, produce a 'Url' which has “http” as its scheme and
 -- empty path. This also sets port to @80@.
@@ -901,7 +909,7 @@ useHttpURI uri = do
         Nothing -> urlHead
         Just (_, xs) ->
           foldl' (/:) urlHead (URI.unRText <$> NE.toList xs)
-  return (url, uriOptions uri)
+  return (url, fromMaybe mempty $ uriOptions uri)
 
 -- | Just like 'useHttpURI', but expects the “https” scheme.
 --
@@ -914,7 +922,7 @@ useHttpsURI uri = do
         Nothing -> urlHead
         Just (_, xs) ->
           foldl' (/:) urlHead (URI.unRText <$> NE.toList xs)
-  return (url, uriOptions uri)
+  return (url, fromMaybe mempty $ uriOptions uri)
 
 -- | A combination of 'useHttpURI' and 'useHttpsURI' for cases when scheme
 -- is not known in advance.
@@ -937,8 +945,53 @@ uriHost uri = case URI.uriAuthority uri of
   Right URI.Authority {..} ->
     Just (URI.unRText authHost)
 
+-- | A quasiquoter to build a 'Url'. Can be used both as an expression and as a
+-- pattern. Only works for URIs that don't involve query options (e.g. port)
+--
+-- >>> [urlQ|https://exmaple.org/test|]
+-- Url Https ("test" :| ["example.org"])
+urlQ :: TH.QuasiQuoter
+urlQ = TH.QuasiQuoter
+  { quoteExp = uriQ
+  , quotePat = \str -> TH.appE [|(==)|] (uriQ str) `TH.viewP` [p|True|]
+  , quoteType = error "This usage is not supported"
+  , quoteDec  = error "This usage is not supported" }
+  where
+    uriQ :: String -> TH.Q TH.Exp
+    uriQ str = do
+      (url, uri) <- urlQShared str
+      case uriOptions uri of
+        Just _ -> fail "URL with options not supported, please use urlWithOptsQ"
+        Nothing -> url
+
+-- | A quasiquoter to build a 'Url' and 'Option' tuple. Can only be used as an
+-- expression.
+--
+-- >>> :t [urlWithOptsQ|https://example.org:443/test?x=1|]
+-- [urlWithOptsQ|https://exmaple.org:443/test?x=1|] :: (Url 'Https, Option scheme)
+urlWithOptsQ :: TH.QuasiQuoter
+urlWithOptsQ = TH.QuasiQuoter
+  { quoteExp = \str -> do
+      (url, uri) <- urlQShared str
+      TH.tupE [url, [|fromMaybe mempty (uriOptions uri)|]]
+  , quotePat = error "This usage is not supported"
+  , quoteType = error "This usage is not supported"
+  , quoteDec  = error "This usage is not supported" }
+
+urlQShared :: String -> TH.Q (TH.ExpQ, URI)
+urlQShared str = case URI.mkURI (T.pack str) of
+  Left err -> fail (displayException err)
+  Right uri -> case useURI uri of
+    Nothing -> fail "Not a URL but a local path"
+    Just eurl ->
+      -- For some reason the lift seems to forget about the scheme, so we add a
+      -- type annotation for it
+      pure ( either ((`TH.sigE` [t|Url 'Http|])  . TH.lift . fst)
+                    ((`TH.sigE` [t|Url 'Https|]) . TH.lift . fst) eurl
+           , uri)
+
 -- | An internal helper function to extract 'Option's from a 'URI'.
-uriOptions :: forall scheme. URI -> Option scheme
+uriOptions :: forall scheme. URI -> Maybe (Option scheme)
 uriOptions uri =
   mconcat
     [ auth,
@@ -956,13 +1009,13 @@ uriOptions uri =
                 Just URI.UserInfo {..} ->
                   let username = T.encodeUtf8 (URI.unRText uiUsername)
                       password = maybe "" (T.encodeUtf8 . URI.unRText) uiPassword
-                   in basicAuthUnsafe username password
+                   in Just $ basicAuthUnsafe username password
               port0 = case authPort of
                 Nothing -> mempty
-                Just port'' -> port (fromIntegral port'')
+                Just port'' -> Just $ port (fromIntegral port'')
            in (auth0, port0)
     query =
-      let liftQueryParam = \case
+      let liftQueryParam = Just . \case
             URI.QueryFlag t -> queryFlag (URI.unRText t)
             URI.QueryParam k v -> URI.unRText k =: URI.unRText v
        in mconcat (liftQueryParam <$> URI.uriQuery uri)
@@ -1756,7 +1809,7 @@ data Scheme
     Http
   | -- | HTTPS
     Https
-  deriving (Eq, Ord, Show, Data, Typeable, Generic)
+  deriving (Eq, Ord, Show, Data, Typeable, Generic, TH.Lift)
 
 ----------------------------------------------------------------------------
 -- Constants
