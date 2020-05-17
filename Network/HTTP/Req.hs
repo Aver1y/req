@@ -12,6 +12,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE RoleAnnotations #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskellQuotes #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -869,6 +870,7 @@ instance HttpMethod method => RequestComponent (Womb "method" method) where
 data Url (scheme :: Scheme) = Url Scheme (NonEmpty Text)
   -- NOTE The second value is the path segments in reversed order.
   deriving (Eq, Ord, Show, Data, Typeable, Generic, TH.Lift)
+type role Url nominal
 
 -- | Given host name, produce a 'Url' which has “http” as its scheme and
 -- empty path. This also sets port to @80@.
@@ -952,8 +954,8 @@ uriHost uri = case URI.uriAuthority uri of
 -- Url Https ("test" :| ["example.org"])
 urlQ :: TH.QuasiQuoter
 urlQ = TH.QuasiQuoter
-  { quoteExp = uriQ
-  , quotePat = \str -> TH.appE [|(==)|] (uriQ str) `TH.viewP` [p|True|]
+  { quoteExp  = uriQ
+  , quotePat  = \str -> TH.appE [|(==)|] (uriQ str) `TH.viewP` [p|True|]
   , quoteType = error "This usage is not supported"
   , quoteDec  = error "This usage is not supported" }
   where
@@ -971,10 +973,10 @@ urlQ = TH.QuasiQuoter
 -- [urlWithOptsQ|https://exmaple.org:443/test?x=1|] :: (Url 'Https, Option scheme)
 urlWithOptsQ :: TH.QuasiQuoter
 urlWithOptsQ = TH.QuasiQuoter
-  { quoteExp = \str -> do
+  { quoteExp  = \str -> do
       (url, uri) <- urlQShared str
       TH.tupE [url, [|fromMaybe mempty (uriOptions uri)|]]
-  , quotePat = error "This usage is not supported"
+  , quotePat  = error "This usage is not supported"
   , quoteType = error "This usage is not supported"
   , quoteDec  = error "This usage is not supported" }
 
